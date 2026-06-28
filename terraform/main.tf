@@ -20,60 +20,50 @@ provider "aws" {
 # ---------------------------------------------------------------------------
 
 variable "aws_region" {
-  type    = string
-  default = "us-east-1"
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
 }
 
 variable "project_name" {
-  type    = string
-  default = "fastapi-ec2"
+  description = "Project name used for resource naming"
+  type        = string
+  default     = "udap-app"
 }
 
 variable "public_key" {
+  description = "SSH public key material for the EC2 key pair"
   type        = string
-  description = "SSH public key material to inject into the EC2 instance"
 }
 
 variable "instance_type" {
-  type    = string
-  default = "t3.micro"
+  description = "EC2 instance type"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "ami_id" {
+  description = "AMI ID (Ubuntu 22.04 LTS us-east-1 default)"
+  type        = string
+  default     = "ami-0c7217cdde317cfec"
 }
 
 # ---------------------------------------------------------------------------
-# Data sources
+# Data
 # ---------------------------------------------------------------------------
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+data "aws_vpc" "default" {
+  default = true
 }
 
 # ---------------------------------------------------------------------------
-# Key pair
-# ---------------------------------------------------------------------------
-
-resource "aws_key_pair" "deploy" {
-  key_name   = "${var.project_name}-key"
-  public_key = var.public_key
-}
-
-# ---------------------------------------------------------------------------
-# Security group
+# Security Group
 # ---------------------------------------------------------------------------
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-sg"
-  description = "Allow SSH and HTTP"
+  description = "Allow HTTP (80), HTTPS (443), and SSH (22)"
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
     description = "SSH"
@@ -87,6 +77,14 @@ resource "aws_security_group" "app" {
     description = "HTTP"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -105,14 +103,33 @@ resource "aws_security_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# EC2 instance
+# SSH Key Pair
+# ---------------------------------------------------------------------------
+
+resource "aws_key_pair" "app" {
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
+
+  tags = {
+    Project = var.project_name
+  }
+}
+
+# ---------------------------------------------------------------------------
+# EC2 Instance
 # ---------------------------------------------------------------------------
 
 resource "aws_instance" "app" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.instance_type
-  key_name               = aws_key_pair.deploy.key_name
-  vpc_security_group_ids = [aws_security_group.app.id]
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  key_name                    = aws_key_pair.app.key_name
+  vpc_security_group_ids      = [aws_security_group.app.id]
+  associate_public_ip_address = true
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+  }
 
   tags = {
     Name    = "${var.project_name}-instance"
@@ -121,7 +138,7 @@ resource "aws_instance" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# Elastic IP - stable public address (survives stop/start)
+# Elastic IP (stable public address)
 # ---------------------------------------------------------------------------
 
 resource "aws_eip" "app" {
@@ -144,6 +161,11 @@ output "instance_public_ip" {
 }
 
 output "app_url" {
-  description = "Public HTTP endpoint"
+  description = "Public HTTP URL of the application"
   value       = "http://${aws_eip.app.public_ip}"
+}
+
+output "ssh_connection" {
+  description = "SSH connection string"
+  value       = "ssh ubuntu@${aws_eip.app.public_ip}"
 }
