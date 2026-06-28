@@ -1,0 +1,295 @@
+---
+- name: Configure EC2 instance and deploy FastAPI application
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: appuser
+    app_group: appuser
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
+    app_entrypoint: "app.main:app"
+    gunicorn_workers: 4
+    gunicorn_bind: "0.0.0.0:8000"
+    service_name: fastapi-app
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - git
+          - curl
+          - software-properties-common
+          - build-essential
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Application user
+    # -------------------------------------------------------------------------
+    - name: Create application group
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        shell: /bin/bash
+        home: /home/{{ app_user }}
+        create_home: true
+        state: present
+
+    # -------------------------------------------------------------------------
+    # Application directory
+    # -------------------------------------------------------------------------
+    - name: Create /opt/app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    # -------------------------------------------------------------------------
+    # Copy application source - preserve repo structure so app/main.py
+    # lands at /opt/app/app/main.py
+    # -------------------------------------------------------------------------
+    - name: Copy app package directory
+      copy:
+        src: "{{ playbook_dir }}/../app/"
+        dest: "{{ app_dir }}/app/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+        directory_mode: "0755"
+
+    - name: Copy main.py (root entrypoint)
+      copy:
+        src: "{{ playbook_dir }}/../main.py"
+        dest: "{{ app_dir }}/main.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+
+    - name: Copy requirements.txt
+      copy:
+        src: "{{ playbook_dir }}/../requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+
+    - name: Check if public/ directory exists locally
+      stat:
+        path: "{{ playbook_dir }}/../public"
+      register: public_dir
+      delegate_to: localhost
+      become: false
+
+    - name: Copy public/ directory if it exists
+      copy:
+        src: "{{ playbook_dir }}/../public/"
+        dest: "{{ app_dir }}/public/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+        directory_mode: "0755"
+      when: public_dir.stat.exists
+
+    # -------------------------------------------------------------------------
+    # Python virtual environment at /opt/app/.venv using python3.11
+    # -------------------------------------------------------------------------
+    - name: Create virtual environment at /opt/app/.venv
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/python"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip inside venv
+      command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+
+    - name: Install Python dependencies into venv
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      become_user: "{{ app_user }}"
+
+    - name: Verify gunicorn is available at expected path
+      stat:
+        path: "{{ gunicorn_bin }}"
+      register: gunicorn_stat
+
+    - name: Fail if gunicorn not found at /opt/app/.venv/bin/gunicorn
+      fail:
+        msg: "gunicorn binary not found at {{ gunicorn_bin }} - check requirements.txt"
+      when: not gunicorn_stat.stat.exists
+
+    # -------------------------------------------------------------------------
+    # Render .env file (even if all values are empty) using shell
+    # -------------------------------------------------------------------------
+    - name: Render .env file via shell
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        APP_ENV=production
+        PORT=8000
+        HOST=0.0.0.0
+        ENVEOF
+        chown {{ app_user }}:{{ app_group }} {{ app_dir }}/.env
+        chmod 640 {{ app_dir }}/.env
+
+    # -------------------------------------------------------------------------
+    # Fix ownership of the whole app directory
+    # -------------------------------------------------------------------------
+    - name: Set ownership of /opt/app recursively
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        recurse: true
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+
+    # -------------------------------------------------------------------------
+    # systemd service unit
+    # -------------------------------------------------------------------------
+    - name: Install systemd service unit for FastAPI app
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI application - {{ service_name }}
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ gunicorn_bin }} app.main:app \
+              -k uvicorn.workers.UvicornWorker \
+              -w {{ gunicorn_workers }} \
+              -b {{ gunicorn_bind }}
+          Restart=on-failure
+          RestartSec=5s
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier={{ service_name }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start FastAPI service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: true
+        state: restarted
+
+    # -------------------------------------------------------------------------
+    # nginx - reverse proxy port 80 -> 127.0.0.1:8000
+    # -------------------------------------------------------------------------
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write nginx site configuration
+      copy:
+        dest: /etc/nginx/sites-available/{{ service_name }}
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          upstream fastapi_app {
+              server 127.0.0.1:8000;
+          }
+
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              access_log /var/log/nginx/{{ service_name }}_access.log;
+              error_log  /var/log/nginx/{{ service_name }}_error.log;
+
+              location / {
+                  proxy_pass         http://fastapi_app;
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ service_name }}
+        dest: /etc/nginx/sites-enabled/{{ service_name }}
+        state: link
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Enable and restart nginx
+      systemd:
+        name: nginx
+        enabled: true
+        state: restarted
+
+    # -------------------------------------------------------------------------
+    # Wait for the app to be healthy on the host itself
+    # -------------------------------------------------------------------------
+    - name: Wait for FastAPI to respond on port 8000
+      uri:
+        url: "http://127.0.0.1:8000/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_result
+      retries: 12
+      delay: 10
+      until: health_result.status == 200
+
+    - name: Wait for nginx to proxy /health on port 80
+      uri:
+        url: "http://127.0.0.1:80/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: nginx_health
+      retries: 6
+      delay: 5
+      until: nginx_health.status == 200
+
+    - name: Print health check result
+      debug:
+        msg: "Application is healthy: {{ health_result.json }}"
