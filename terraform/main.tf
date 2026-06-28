@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
   }
 
   backend "s3" {}
@@ -24,32 +20,23 @@ provider "aws" {
 # ---------------------------------------------------------------------------
 
 variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
+  type    = string
+  default = "us-east-1"
 }
 
 variable "project_name" {
-  description = "Project name used for resource naming"
-  type        = string
-  default     = "udap-app"
+  type    = string
+  default = "fastapi-ec2"
 }
 
 variable "public_key" {
-  description = "SSH public key material for the EC2 key pair"
   type        = string
+  description = "SSH public key material to inject into the EC2 instance"
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
-  type        = string
-  default     = "t3.micro"
-}
-
-variable "ami_id" {
-  description = "AMI ID - defaults to latest Ubuntu 22.04 LTS in us-east-1"
-  type        = string
-  default     = ""
+  type    = string
+  default = "t3.micro"
 }
 
 # ---------------------------------------------------------------------------
@@ -71,23 +58,13 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-locals {
-  ami = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
-}
-
 # ---------------------------------------------------------------------------
-# Networking - use the default VPC for simplicity
+# Key pair
 # ---------------------------------------------------------------------------
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
+resource "aws_key_pair" "deploy" {
+  key_name   = "${var.project_name}-key"
+  public_key = var.public_key
 }
 
 # ---------------------------------------------------------------------------
@@ -96,11 +73,10 @@ data "aws_subnets" "default" {
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-sg"
-  description = "Allow SSH and HTTP; deny direct access to app port 8000"
-  vpc_id      = data.aws_vpc.default.id
+  description = "Allow SSH and HTTP"
 
   ingress {
-    description = "SSH for Ansible"
+    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -108,7 +84,7 @@ resource "aws_security_group" "app" {
   }
 
   ingress {
-    description = "HTTP via nginx"
+    description = "HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -129,35 +105,14 @@ resource "aws_security_group" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# SSH key pair
-# ---------------------------------------------------------------------------
-
-resource "aws_key_pair" "app" {
-  key_name   = "${var.project_name}-key"
-  public_key = var.public_key
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-# ---------------------------------------------------------------------------
 # EC2 instance
 # ---------------------------------------------------------------------------
 
 resource "aws_instance" "app" {
-  ami                         = local.ami
-  instance_type               = var.instance_type
-  key_name                    = aws_key_pair.app.key_name
-  vpc_security_group_ids      = [aws_security_group.app.id]
-  subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
-  associate_public_ip_address = true
-
-  root_block_device {
-    volume_size           = 20
-    volume_type           = "gp3"
-    delete_on_termination = true
-  }
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  key_name               = aws_key_pair.deploy.key_name
+  vpc_security_group_ids = [aws_security_group.app.id]
 
   tags = {
     Name    = "${var.project_name}-instance"
@@ -166,7 +121,7 @@ resource "aws_instance" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# Elastic IP - stable public address
+# Elastic IP - stable public address (survives stop/start)
 # ---------------------------------------------------------------------------
 
 resource "aws_eip" "app" {
@@ -189,11 +144,6 @@ output "instance_public_ip" {
 }
 
 output "app_url" {
-  description = "HTTP URL of the deployed application"
+  description = "Public HTTP endpoint"
   value       = "http://${aws_eip.app.public_ip}"
-}
-
-output "health_url" {
-  description = "Health check URL"
-  value       = "http://${aws_eip.app.public_ip}/health"
 }
